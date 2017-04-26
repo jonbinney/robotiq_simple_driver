@@ -1,0 +1,240 @@
+#!/usr/bin/env python
+# Software License Agreement (BSD License)
+#
+# Copyright (c) 2012, Robotiq, Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above
+#    copyright notice, this list of conditions and the following
+#    disclaimer in the documentation and/or other materials provided
+#    with the distribution.
+#  * Neither the name of Robotiq, Inc. nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+# Copyright (c) 2012, Robotiq, Inc.
+# Revision $Id$
+#
+# Modified from the orginal comModbusTcp by Kelsey Hawkins @ Georgia Tech
+# Modified again from and moved into a standalone package by Jon Binney
+import actionlib
+import robotiq_simple_driver.msg
+from math import ceil
+from pymodbus.client.sync import ModbusSerialClient
+import rospy
+import sys
+import time
+
+class Status:
+    """
+    Data-only class for holding Robotiq gripper status info.
+    """
+    def __init__(self):
+        self.gACT = None # Activation goal
+        self.gGTO = None # Movement goal
+        self.gSTA = None # State
+        self.gOBJ = None # Object-in-gripper status
+        self.gFLT = None # Fault
+        self.gPR  = None
+        self.gPO  = None
+        self.gCU  = None
+
+    def __str__(self):
+        # To keep things short we only print the most important bits
+        return 'gACT: {}, gGTO: {}, gSTA: {}, gFLT: {}'.format(
+            self.gACT,
+            self.gGTO,
+            self.gSTA,
+            self.gFLT)
+
+class RobotiqClient:
+    """
+    Controls a Robotiq 2-Finger gripper over Modbus-RTU.
+    """
+    def __init__(self, port):
+        self.client = ModbusSerialClient(
+            method='rtu',
+            port=port,
+            stopbits=1,
+            bytesize=8,
+            baudrate=115200,
+            timeout=0.2)
+
+        # Activate the gripper. For some reason this requires first setting rACT to zero, then
+        # setting rACT to 1.
+        self.send_command([0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        self.send_command([0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+        if not self.client.connect():
+            raise RuntimeError('Unable to connect to %s'.format(device))
+
+    def __del__(self):
+        """Close connection"""
+        self.client.close()
+
+    def send_command(self, data):
+       """
+       Send a command to the Gripper - the method takes a list of uint8 as an argument. The meaning
+       of each variable depends on the Gripper model (see support.robotiq.com for more details)
+       """
+       # Make sure data has an even number of elements
+       if(len(data) % 2 == 1):
+          data.append(0)
+
+       # Initiate message as an empty list
+       message = []
+
+       # Fill message by combining two bytes in one register
+       for i in range(0, len(data)/2):
+          message.append((data[2*i] << 8) + data[2*i+1])
+
+       # To do: Implement try/except
+       self.client.write_registers(0x03E8, message, unit=0x0009)
+
+    def get_status(self):
+       """
+       Sends a request to read, wait for the response and returns the Gripper status.
+       """
+       numRegs = 3
+
+       # To do: Implement try/except 
+       # Get status from the device
+       response = self.client.read_holding_registers(0x07D0, numRegs, unit=0x0009)
+
+       # Fill the output with the bytes in the appropriate order
+       response_bytes = []
+       for i in range(0, numRegs):
+          response_bytes.append((response.getRegister(i) & 0xFF00) >> 8)
+          response_bytes.append(response.getRegister(i) & 0x00FF)
+
+       # Assign the values to their respective variables
+       status = Status()
+       status.gACT = (response_bytes[0] >> 0) & 0x01;
+       status.gGTO = (response_bytes[0] >> 3) & 0x01;
+       status.gSTA = (response_bytes[0] >> 4) & 0x03;
+       status.gOBJ = (response_bytes[0] >> 6) & 0x03;
+       status.gFLT =  response_bytes[2]
+       status.gPR  =  response_bytes[3]
+       status.gPO  =  response_bytes[4]
+       status.gCU  =  response_bytes[5]
+
+       # Output the result
+       return status
+
+    def grasp(self):
+        # 0 is fully open; 255 is fully closed
+        rPR = 0xFF
+        # 0 is minimum speed, 255 is maximum speed
+        rSP = 0xFF
+        # 0 is minimum force (~25 N) and 255 is maximum force (~220 N)
+        rFR = 0x00
+        self.send_command([0x09, 0x00, 0x00, rPR, rSP, rFR])
+
+        while not rospy.is_shutdown():
+            status = self.get_status()
+            if status.gFLT != 0:
+                raise RuntimeError('Fault during gripper movement: {}'.format(status.gFLT))
+
+            if status.gOBJ == 0:
+                # Fingers still in motion
+                pass
+            elif status.gOBJ == 2:
+                # Fingers stopped due to contact with object
+                return
+            elif status.gOBJ == 3:
+                raise RuntimeError('No object encountered during grasp')
+            else:
+                raise RuntimeError('Unexpected status code: gOBJ={}'.format(status.gOBJ))
+
+    def open(self):
+        self.send_command([0x09, 0x00, 0x00, 0x00, 0xFF, 0xFF])
+        while not rospy.is_shutdown():
+            status = self.get_status()
+            if status.gFLT != 0:
+                raise RuntimeError('Fault during gripper movement: {}'.format(status.gFLT))
+
+            if status.gOBJ == 0:
+                # Fingers still in motion
+                pass
+            elif status.gOBJ == 1:
+                # Fingers stopped due to contact with object
+                raise ValueError('Unexpected contact while opening')
+            elif status.gOBJ == 3:
+                return
+            else:
+                raise RuntimeError('Unexpected status code: gOBJ={}'.format(status.gOBJ))
+
+class GripperActionServer:
+    def __init__(self, name):
+        # Serial port device connected to gripper
+        port = rospy.get_param('~port')
+
+        # Connect to the gripper
+        self._client = RobotiqClient(port)
+        r = rospy.Rate(10)
+        while True:
+            status = self._client.get_status()
+            if status.gSTA == 3:
+                rospy.loginfo('Gripper ready')
+                break
+            r.sleep()
+
+        self._action_name = name
+        self._as = actionlib.SimpleActionServer(
+            self._action_name,
+            robotiq_simple_driver.msg.MoveGripperAction,
+            execute_cb=self.execute_cb,
+            auto_start=False)
+        self._as.start()
+
+    def execute_cb(self, goal):
+        if goal.move_type == goal.MOVE_GRASP:
+            rospy.loginfo('Grasping')
+            result = robotiq_simple_driver.msg.MoveGripperResult()
+            try:
+                self._client.grasp()
+                result.result = result.RESULT_SUCCESS
+            except RuntimeError as e:
+                rospy.logerr('Grasp failed: {}'.format(e))
+                result.result = result.RESULT_FAILURE
+            self._as.set_succeeded(result)
+        elif goal.move_type == goal.MOVE_OPEN:
+            rospy.loginfo('Opening gripper')
+            result = robotiq_simple_driver.msg.MoveGripperResult()
+            try:
+                self._client.open()
+                result.result = result.RESULT_SUCCESS
+            except RuntimeError as e:
+                rospy.logerr('Opening gripper failed: {}'.format(e))
+                result.result = result.RESULT_FAILURE
+            self._as.set_succeeded(result)
+        else:
+            rospy.loginfo('Bad move type: {}'.format(goal.move_type))
+            self._as.set_aborted(result)
+
+
+if __name__ == '__main__':
+    rospy.init_node('robotiq_driver')
+    action_server = GripperActionServer("gripper_server")
+    rospy.spin()
+
+
